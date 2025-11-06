@@ -1,104 +1,126 @@
-## Варианты расчёта наведения
+# Функция вознаграждения для «Бражника» (камера + IMU)
 
-### A) Симуляция
+**Цель.** Научить дрон с монокамерой надёжно входить в цель («таран») без потери цели из кадра и без перелётов из‑за инерции. Управление: **roll, pitch и газ** (yaw не используется). Камера по оси **Z** корпуса.
 
-Считаем вектор вперёд (F) из движка и вектор на цель (L).
+---
 
-Показатель наведения — косинус угла между ними:
+## 1. Отличия «Бражника» от FPV
 
-$$ \cos\theta = \langle F, L\rangle $$
+* Поступательная скорость задаётся **газом**, а не тангажом (в отличие от FPV).
+* Большая инерция и задержки: «наклон → ускорение → траектория» — длинная цепочка, поэтому «агрессивное сближение» по дальности приводит к промахам.
+* Задача наведения — **совмещать луч носа с лучом на цель** и **умно дозировать газ**: далеко — поддать; близко и не по центру — пригасить.
 
-$$ F = \texttt{GetActorForwardVector()} $$
+---
 
-$$ L = \frac{p_{\text{target}} - p_{\text{drone}}}{\lVert p_{\text{target}} - p_{\text{drone}}\rVert} $$
+## 2. Наблюдения и обозначения (исходя из того что можно получить в IRL)
 
-Реальная дистанция и скорость сближения вдоль LOS:
+* **u, v** — центр цели в кадре, нормализованный в диапазон ([-1,1]):
+$$u=\frac{x-c_x}{W/2},\quad v=\frac{y-c_y}{H/2}$$
+* **thr** — «газ» (управляющий сигнал на суммарную тягу), не скорость.
+* **roll, pitch** — текущие углы крена/тангажа корпуса.
+* **p, q** — угловые скорости по крену/тангажу (рад/с) с IMU.
+* **bbox, S_{bbox}** — детекция цели и её площадь в пикселях (прокси‑дальность: (S\propto 1/d^2)).
+* **lost** — индикатор потери цели (вышла из кадра/нет детекции).
 
-$$ d = \lVert p_{\text{target}} - p_{\text{drone}}\rVert $$
+> Принцип: **никакой зависимости от HFOV/VFOV**. Работает на нормализованных пикселях, модель переносима между камерами.
 
-$$ v_{\text{close}} = \langle v_{\text{drone}} - v_{\text{target}}, L \rangle $$
+---
 
-### B) IRL / только камера
+## 3. Векторы наведения
 
-Координаты не нужны — считаем всё по изображению (pinhole-модель).
+* **Луч носа:**
+$$n_f = [0, 0, 1]^\top \quad (\text{ось камеры/корпуса})$$
+* **Луч на цель из картинки:**
+$$n_t = \frac{[u,\ v,\ 1]^\top}{\big|[u,\ v,\ 1]^\top\big|}$$
+* **Совпадение (угловая ошибка):**
+$$\cos\theta = n_f^\top n_t \in [-1,1]$$
+* **Ось «куда крутиться»:**
+$$\hat r = \frac{n_f \times n_t}{|n_f \times n_t|}$$
 
-Пусть \((u,v)\) — центр bbox, \((u_0,v_0)\) — центр кадра, размер кадра \(W\times H\), поля зрения HFOV/VFOV.
+---
 
-$$ \theta_x \approx \arctan\left(\tan\left(\frac{\mathrm{HFOV}}{2}\right) \cdot \frac{2(u - u_0)}{W}\right) $$
+## 4. Итоговая формула награды
 
-$$ \theta_y \approx \arctan\left(\tan\left(\frac{\mathrm{VFOV}}{2}\right) \cdot \frac{2(v - v_0)}{H}\right) $$
+$$ R = w_{\text{align}} R_{\text{align}} + w_{\omega} R_{\omega} + w_{\text{thr}} R_{\text{thr}} + w_{\text{prog}} R_{\text{prog}} + w_{\text{smooth}} R_{\text{smooth}} + C_{\text{time}} - K_{\text{lost}} \cdot \mathbf{1}[\text{lost}] - K'_{\text{lost}} \cdot t_{\text{lost}} + R_{\text{collision}} $$
 
-$$ \theta = \sqrt{\theta_x^2 + \theta_y^2} $$
+Все члены по возможности нормируются/клиппируются в ([-1,1]).
 
-$$ \cos\theta = \cos(\theta) $$
+---
 
-## Итоговая формула
+## 5. Компоненты награды
 
-$$ R = W_{\text{align}} \cdot R_{\text{align}} + W_{\text{prog}} \cdot R_{\text{prog}} + W_{\text{throttle}} \cdot R_{\text{throttle}} + W_{\text{smooth}} \cdot R_{\text{smooth}} + C_{\text{time}} + K_{\text{lost}} \cdot \mathbf{1}[\text{lost}] + R_{\text{collision}} $$
+### 5.1 Наведение «лучом носа»
+$$ R_{\text{align}} = \cos\theta = n_f^\top n_t $$
 
-## Компоненты
+### 5.2 Угловые скорости в «нужную сторону» (IMU)
 
-### 1) Наведение (луч носа)
+Обозначим вектор угловых скоростей по управляемым осям: $\omega_{b} = [p, q]^\top$.
 
-$$ R_{\text{align}} = \cos\theta $$
+$$ R_{\omega} = \underbrace{\hat r^\top \omega_b}_{\text{вращайся в нужную сторону}} - \beta \cdot \underbrace{\big|\omega_b - (\hat r^\top \omega_b) \hat r\big|}_{\text{подави поперечную дрожь}} $$
 
-**Вариант A:**
+### 5.3 Газ по ситуации (далеко — поддай, близко и не по центру — убери)
 
-$$ \cos\theta = \langle F, L\rangle $$
+Обозначим:
+* $\hat d$ — «дальность»: в **симе** — истинная $d$; в **IRL** — прокси $\hat d \propto 1/\sqrt{S_{\text{bbox}}}$;
+* $\rho = \sqrt{u^2+v^2}$ — угловая ошибка в кадре;
+* сглаженные гейты (логистики):
+$$g_{\text{far}}(\hat d) = \sigma\left(\frac{\hat d - d_{\text{near}}}{s_d}\right),\quad g_{\text{near}}=1-g_{\text{far}},\quad a(\cos\theta)=\sigma\left(\frac{\cos\theta-\tau}{s_\theta}\right).$$
 
-$$ F = \texttt{GetActorForwardVector()} $$
+Тогда:
+R_thr = k_far * thr * g_far * a - k_near * thr * g_near * (1 - a)
 
-$$ L = \frac{p_{\text{target}} - p_{\text{drone}}}{\lVert p_{\text{target}} - p_{\text{drone}}\rVert} $$
+### 5.4 Прогресс по сближению (вторично, с клиппингом)
+$$ R_{\text{prog}} = \text{clip}(d_{t-1} - d_t, -\delta, \delta) $$
+* **Сим:** $d_t = |p_{\text{target}}-p_{\text{drone}}|$.
+* **IRL:** $d_t$ заменяем прокси $\tilde d_t \propto 1/\sqrt{S_{\text{bbox}}}$ — только для «далеко/близко».
 
-**Вариант B:**
+### 5.5 Плавность управления (штраф за рывки)
+$$ R_{\text{smooth}} = -\lambda_{\text{ang}} \cdot |a^{\text{ang}}_t - a^{\text{ang}}_{t-1}|^2 - \lambda_{\text{thr}} \cdot (\texttt{thr}_t - \texttt{thr}_{t-1})^2 $$
+Здесь $a^{\text{ang}}$ — вектор команд по roll/pitch.
 
-$\cos\theta$ из формул выше (через пиксельное смещение и HFOV/VFOV).
+### 5.6 Время и потеря цели
+$$ C_{\text{time}} = -c_t, \qquad - K_{\text{lost}} \cdot \mathbf{1}[\text{lost}] - K'_{\text{lost}} \cdot t_{\text{lost}} $$
 
-### 2) Прогресс по сближению
+### 5.7 Столкновение
+$$ R_{\text{collision}} = \begin{cases} +R_c,\ \texttt{done}=\texttt{True}, & \text{если зафиксирована коллизия}, \\ 0, & \text{иначе}. \end{cases} $$
 
-$$ R_{\text{prog}} = \min\left(\delta, \max\left(-\delta, d_{t-1} - d_t\right)\right) $$
+---
 
-**A:** $d_t = \lVert p_{\text{target}} - p_{\text{drone}}\rVert$
+## 6. Параметры
 
-**B:** $d_t$ заменяем на прокси $\tilde{d} \propto 1/\sqrt{S_{\text{bbox}}}$ (только для «близко/далеко»).
+Нормализовать компоненты в ([-1,1]). Базовые веса и пороги:
 
-### 3) Умный набор скорости (скорость закрытия, с гейтами)
+* Веса:
+$$w_{\text{align}}=1.0,\quad w_{\omega}=0.6,\quad w_{\text{thr}}=0.4,\quad w_{\text{prog}}=0.2\ (\text{IRL: }0.05),\quad w_{\text{smooth}}=0.05$$
+* Время/потеря/коллизия:
+$$c_t=0.01,\quad K_{\text{lost}}=1.0,\quad K'_{\text{lost}}=0.02,\quad R_c=10$$
+* Гейты газа:
+$$k_{\text{far}}\approx k_{\text{near}}\in[0.5,1.5],\quad \tau\in[0.3,0.7],\quad d_{\text{near}}\ \text{под конкретный сетап},\quad s_d, s_\theta\ \text{— мягкость переходов}$$
+* Клиппинг прогресса: $\delta$ — малая доля шага.
 
-$$
-R_{\text{throttle}} =
-\begin{cases}
-\max(0, v_{\text{close}}), & \text{если } d > d_{\text{far}} \text{ и } \cos\theta > \tau, \\
--\alpha \cdot \max(0, v_{\text{close}}), & \text{если } d < d_{\text{near}} \text{ и } \cos\theta < \cos\theta_{\min}, \\
-0, & \text{иначе}.
-\end{cases}
-$$
+---
 
-где $v_{\text{close}} = \langle v_{\text{drone}} - v_{\text{target}}, L\rangle$
+## 7. Симуляция: данные по размерам и скорости цели (ускоряет обучение)
 
-(если $v_{\text{target}}$ неизвестна, берём $\langle v_{\text{drone}}, L\rangle$)
+**Только в симе** можно добавить члены, зависящие от «истины»:
 
-**A:** $d$ — реальная дистанция.
+* **Анти-скольжение (против промаха):**
+L = (p_t - p_d) / |p_t - p_d|
+v_rel = v_d - v_t
+v_perp = |(I - LL^T) v_rel|
+R_perp = -η * v_perp
+Штрафуем **поперечную** к LOS скорость, которая ответственна за промахи.
 
-**B:** $d$ — прокси по площади bbox (порог «близко/далеко»).
+* **Прогресс по истинной дальности** — оставляем **маленьким** (как мягкий указатель).
 
-### 4) Плавность управления
+В IRL эти члены заменяются прокси из камеры: величины на базе $S_{\text{bbox}}$ и скорости сдвига бокса $(\dot u, \dot v)$.
 
-$$ R_{\text{smooth}} = \lVert a_t - a_{t-1}\rVert^2 $$
+---
 
-### 5) Штраф за время
+## 8. Заметки
 
-$$ C_{\text{time}} = \text{малый постоянный штраф за каждый шаг} $$
+* Обновлять $(u,v)$ и IMU на каждом шаге; использовать лёгкое сглаживание (EMA) без задержек.
+* Следите, чтобы шкалы/единицы у всех членов были сопоставимы (перед весами нормализовать).
+* Потеря цели должна быть **дорогой**; столкновение — **главный бонус**.
 
-### 6) Потеря цели
-
-$$ K_{\text{lost}} \cdot \mathbf{1}[\text{lost}] $$
-
-### 7) Коллизия (финальная награда)
-
-$$
-R_{\text{collision}} =
-\begin{cases}
-R_c, \text{ и } \texttt{done} = \texttt{True}, & \text{если зафиксирована коллизия}, \\
-0, & \text{иначе}.
-\end{cases}
-$$
+---
